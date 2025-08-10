@@ -1,0 +1,146 @@
+﻿import os, json, asyncio, re
+from typing import List, Dict, Optional
+
+import httpx
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse, HTMLResponse
+from pydantic import BaseModel
+
+APP_NAME = "LLM Studio"
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+
+app = FastAPI(title=APP_NAME)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)
+
+@app.get("/version")
+def version():
+    import sys, fastapi, uvicorn
+    return {
+        "python": sys.version.split()[0],
+        "fastapi": fastapi.__version__,
+        "uvicorn": uvicorn.__version__,
+    }
+
+@app.get("/__routes")
+def routes():
+    return sorted([f"{r.path} [{','.join(r.methods)}]" for r in app.router.routes])
+
+async def _ollama_up() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as c:
+            r = await c.get(f"{OLLAMA_HOST}/api/tags")
+            return r.status_code == 200
+    except Exception:
+        return False
+
+@app.get("/api/models")
+async def list_models():
+    if await _ollama_up():
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(f"{OLLAMA_HOST}/api/tags")
+            tags = r.json().get("models", [])
+            return {"provider": "ollama", "models": [t.get("name") for t in tags if t.get("name")]}
+    return {"provider": "local-fallback", "models": ["fallback-local"]}
+
+def _fallback_reply(messages: List[Dict[str, str]]) -> str:
+    user = next((m.get("content","") for m in reversed(messages) if m.get("role")=="user"), "").strip()
+    if user.lower().startswith(("sum ","add ")):
+        nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", user)]
+        return f"Sum: {sum(nums)}" if nums else "I didn't find any numbers to add."
+    if user.lower() in {"hi","hello","hey"}:
+        return "Hey! Local fallback responding. Ask me anything."
+    if not user:
+        return "I'm here. Ask me something."
+    return f"Local fallback: you said -> {user}"
+
+class ChatRequest(BaseModel):
+    messages: List[Dict[str, str]]
+    model: Optional[str] = None
+    stream: bool = True
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    if await _ollama_up():
+        payload = {"model": req.model or "llama3.2", "messages": req.messages, "stream": True}
+        async def sse():
+            try:
+                async with httpx.AsyncClient(timeout=None) as c:
+                    async with c.stream("POST", f"{OLLAMA_HOST}/api/chat", json=payload) as resp:
+                        async for line in resp.aiter_lines():
+                            if not line:
+                                continue
+                            try:
+                                obj = json.loads(line)
+                                if "message" in obj and obj["message"].get("content"):
+                                    yield f"data: {json.dumps({'delta': obj['message']['content']})}\n\n"
+                                if obj.get("done"):
+                                    yield "event: end\ndata: {}\n\n"
+                            except Exception:
+                                yield f"data: {json.dumps({'delta': line})}\n\n"
+            except Exception as e:
+                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        return StreamingResponse(sse(), media_type="text/event-stream")
+
+    # local deterministic fallback (no downloads/keys)
+    text = _fallback_reply(req.messages)
+    async def sse_local():
+        for ch in text:
+            await asyncio.sleep(0)
+            yield f"data: {json.dumps({'delta': ch})}\n\n"
+        yield "event: end\ndata: {}\n\n"
+    return StreamingResponse(sse_local(), media_type="text/event-stream")
+
+_UI_HTML = r"""<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>LLM Studio — Chat</title>
+<style>
+:root{--bg:#0f172a;--panel:#111827;--ink:#e5e7eb;--muted:#9ca3af;--acc:#22d3ee}
+*{box-sizing:border-box}body{margin:0;font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink)}
+header{padding:14px 18px;border-bottom:1px solid #1f2937;display:flex;gap:12px;align-items:center}
+header h1{margin:0;font-size:18px;letter-spacing:.3px}.pill{background:#0b1220;border:1px solid #1f2937;border-radius:999px;padding:6px 10px;color:var(--muted)}
+main{height:calc(100vh - 60px);display:grid;grid-template-rows:1fr auto}#log{padding:20px;overflow-y:auto}
+.msg{max-width:900px;margin:0 auto 14px;display:flex;gap:10px}.role{font-weight:600;color:var(--acc);width:70px;flex:0 0 70px;text-align:right}
+.bubble{background:var(--panel);border:1px solid #1f2937;border-radius:14px;padding:10px 12px;white-space:pre-wrap}.you .role{color:#a3e635}
+form{display:flex;gap:10px;padding:14px 20px;background:#0b1220;border-top:1px solid #1f2937}
+textarea{flex:1;resize:vertical;min-height:52px;max-height:160px;padding:12px;background:#0a0f1d;color:var(--ink);border:1px solid #1f2937;border-radius:12px}
+button,select{background:#111827;color:var(--ink);border:1px solid #1f2937;border-radius:12px;padding:10px 12px;cursor:pointer}button:hover{border-color:#2dd4bf}
+.toolbar{display:flex;gap:10px;margin-left:auto}.muted{color:var(--muted);font-size:12px;margin-left:8px}
+</style></head><body>
+<header><h1>LLM Studio — Chat</h1><span class="pill" id="provider">detecting…</span>
+<div class="toolbar"><label>Model <select id="model"></select></label></div></header>
+<main><div id="log"></div>
+<form id="composer"><textarea id="input" placeholder="Type and Enter…"></textarea><button id="send" type="submit">Send</button></form>
+</main>
+<script>
+const el={log:document.getElementById('log'),input:document.getElementById('input'),form:document.getElementById('composer'),model:document.getElementById('model'),provider:document.getElementById('provider')};
+let history=[{role:"system",content:"You are a helpful assistant."}];
+function addMessage(role,text){const w=document.createElement('div');w.className='msg '+(role==='user'?'you':'bot');const r=document.createElement('div');r.className='role';r.textContent=role;const b=document.createElement('div');b.className='bubble';b.textContent=text;w.appendChild(r);w.appendChild(b);el.log.appendChild(w);el.log.scrollTop=el.log.scrollHeight;return b;}
+async function loadModels(){try{const res=await fetch('/api/models');const d=await res.json();el.provider.textContent=d.provider;el.model.innerHTML='';d.models.forEach(n=>{const o=document.createElement('option');o.value=o.textContent=n;el.model.appendChild(o);});}catch(e){el.provider.textContent='unknown';el.model.innerHTML='<option>fallback-local</option>';}}
+loadModels();
+async function send(){const text=el.input.value.trim();if(!text)return;el.input.value='';history.push({role:'user',content:text});addMessage('user',text);const bubble=addMessage('assistant','');const res=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messages:history,model:el.model.value,stream:true})});const reader=res.body.getReader();const dec=new TextDecoder();let buf='';for(;;){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split('\\n\\n');buf=parts.pop();for(const p of parts){const line=p.trim();if(!line)continue;if(line.startsWith('event: end')){break;}if(line.startsWith('data: ')){try{const payload=JSON.parse(line.slice(6));if(payload.delta)bubble.textContent+=payload.delta;}catch{}}}}history.push({role:'assistant',content:bubble.textContent});}
+el.form.addEventListener('submit',e=>{e.preventDefault();send();});
+el.input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
+</script></body></html>
+"""
+@app.get("/ui")
+def ui():
+    return HTMLResponse(_UI_HTML)
+
+@app.get("/")
+def root():
+    return {"name": APP_NAME, "message": "It works!", "health": "/health", "ui": "/ui"}
+

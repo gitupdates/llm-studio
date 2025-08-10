@@ -1,0 +1,779 @@
+﻿import os, re, io, json, math, time, asyncio, pathlib, hashlib, unicodedata
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass
+
+import httpx
+from bs4 import BeautifulSoup
+from pypdf import PdfReader
+
+from fastapi import FastAPI, UploadFile, File, Form, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import (
+    Response, StreamingResponse, HTMLResponse, JSONResponse, FileResponse
+)
+from pydantic import BaseModel
+
+# ----------------------------
+# Paths & config
+# ----------------------------
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+DATA = ROOT / "data"
+UPLOADS = DATA / "uploads"
+DOCS = DATA / "docs"
+EXPORTS = DATA / "exports"
+INDEX_PATH = DATA / "index.json"
+CONFIG_PATH = DATA / "config.json"
+
+for p in (DATA, UPLOADS, DOCS, EXPORTS):
+    p.mkdir(parents=True, exist_ok=True)
+
+APP_NAME = "LLM Studio"
+DEFAULT_CONFIG = {
+    "ollama_host": os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
+    "model": "llama3.2",
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "max_tokens": 512,
+    "rag_enabled": True,
+    "rag_k": 4,
+    "chunk_size": 800,
+    "chunk_overlap": 120,
+    "web_enabled": False
+}
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def load_config() -> Dict:
+    if CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            return {**DEFAULT_CONFIG, **cfg}
+        except Exception:
+            pass
+    CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2), encoding="utf-8")
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg: Dict):
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+CONFIG = load_config()
+
+def norm_filename(name: str) -> str:
+    name = unicodedata.normalize("NFKC", name)
+    name = re.sub(r"[^\w\-. ]+", "_", name)
+    return name.strip().lstrip(".")[:200] or "file"
+
+def sha1(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
+
+def read_txt(path: pathlib.Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+def read_pdf(path: pathlib.Path) -> str:
+    text = []
+    with path.open("rb") as f:
+        reader = PdfReader(f)
+        for page in reader.pages:
+            try:
+                text.append(page.extract_text() or "")
+            except Exception:
+                pass
+    return "\n".join(text)
+
+def html_to_text(html: str) -> Tuple[str, str]:
+    soup = BeautifulSoup(html, "html.parser")
+    title = (soup.title.string or "").strip() if soup.title else ""
+    for tag in soup(["script", "style", "noscript"]): tag.decompose()
+    body = soup.get_text(separator="\n")
+    body = re.sub(r"\n{2,}", "\n\n", body)
+    return title, body.strip()
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+STOP = set("""
+a an and are as at be by for from has have if in into is it of on or that the to was were will with
+""".split())
+
+def tokenize(text: str) -> List[str]:
+    toks = [t.lower() for t in TOKEN_RE.findall(text)]
+    return [t for t in toks if t not in STOP]
+
+# ----------------------------
+# Simple BM25 index over chunks
+# ----------------------------
+@dataclass
+class Index:
+    N: int
+    df: Dict[str, int]
+    tf: Dict[str, Dict[str,int]]
+    length: Dict[str, int]
+    chunks: Dict[str, Dict]
+    docs: Dict[str, Dict]
+
+    @property
+    def avg_len(self) -> float:
+        return (sum(self.length.values()) / self.N) if self.N else 0.0
+
+def load_index() -> Index:
+    if INDEX_PATH.exists():
+        obj = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
+        return Index(**obj)
+    empty = Index(0, {}, {}, {}, {}, {})
+    INDEX_PATH.write_text(json.dumps(empty.__dict__, ensure_ascii=False), encoding="utf-8")
+    return empty
+
+def save_index(idx: Index):
+    INDEX_PATH.write_text(json.dumps(idx.__dict__, ensure_ascii=False), encoding="utf-8")
+
+def chunk_text(text: str, size: int, overlap: int) -> List[str]:
+    if size <= 0: return [text]
+    out = []
+    i = 0
+    while i < len(text):
+        out.append(text[i:i+size])
+        i += max(1, size - overlap)
+    return out
+
+def reindex_all(cfg: Dict) -> Index:
+    idx = Index(0, {}, {}, {}, {}, {})
+    for p in DOCS.glob("*.txt"):
+        doc_id = p.stem
+        title = p.name
+        raw = read_txt(p)
+        chunks = chunk_text(raw, cfg["chunk_size"], cfg["chunk_overlap"])
+        for ci, chunk in enumerate(chunks):
+            chunk_id = f"{doc_id}#c{ci}"
+            toks = tokenize(chunk)
+            if not toks: continue
+            idx.chunks[chunk_id] = {"text": chunk, "doc": doc_id}
+            idx.length[chunk_id] = len(toks)
+            tf = {}
+            for t in toks: tf[t] = tf.get(t,0) + 1
+            idx.tf[chunk_id] = tf
+            for t in tf.keys(): idx.df[t] = idx.df.get(t,0) + 1
+            idx.N += 1
+        idx.docs[doc_id] = {"title": title, "path": str(p), "source": "file"}
+    save_index(idx)
+    return idx
+
+def add_document(title: str, text: str, source: str, cfg: Dict) -> Index:
+    doc_id = norm_filename(title) or sha1(title)[:12]
+    path = DOCS / f"{doc_id}.txt"
+    path.write_text(text, encoding="utf-8")
+    return reindex_all(cfg)
+
+def bm25_search(query: str, idx: Index, k: int = 4, k1: float = 1.5, b: float = 0.75) -> List[Tuple[str, float]]:
+    if idx.N == 0: return []
+    q_terms = tokenize(query)
+    scores: Dict[str,float] = {}
+    avg_len = idx.avg_len or 1.0
+    for t in q_terms:
+        df = idx.df.get(t, 0)
+        if df == 0: continue
+        idf = math.log((idx.N - df + 0.5) / (df + 0.5) + 1.0)
+        for chunk_id, tfmap in idx.tf.items():
+            f = tfmap.get(t, 0)
+            if f == 0: continue
+            L = idx.length.get(chunk_id, 1)
+            denom = f + k1*(1 - b + b*(L/avg_len))
+            score = idf * ((f*(k1+1)) / denom)
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + score
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return ranked[:k]
+
+INDEX = load_index()
+
+# ----------------------------
+# FastAPI
+# ----------------------------
+app = FastAPI(title=APP_NAME)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+# ---------- Health / utils ----------
+@app.get("/health")
+def health(): return {"status":"ok"}
+
+@app.get("/favicon.ico")
+def favicon(): return Response(status_code=204)
+
+@app.get("/version")
+def version():
+    import sys, fastapi, uvicorn
+    return {"python": sys.version.split()[0], "fastapi": fastapi.__version__, "uvicorn": uvicorn.__version__}
+
+@app.get("/__routes")
+def routes(): return sorted([f"{r.path} [{','.join(r.methods)}]" for r in app.router.routes])
+
+# ---------- Settings ----------
+@app.get("/api/settings")
+def get_settings(): return CONFIG
+
+@app.put("/api/settings")
+def update_settings(payload: Dict):
+    global CONFIG, INDEX
+    CONFIG.update({k:v for k,v in payload.items() if k in DEFAULT_CONFIG})
+    save_config(CONFIG)
+    if "chunk_size" in payload or "chunk_overlap" in payload:
+        INDEX = reindex_all(CONFIG)
+    return CONFIG
+
+# ---------- File upload / list / download ----------
+@app.post("/api/files/upload")
+async def upload_files(files: List[UploadFile] = File(...), ingest: bool = Query(False)):
+    saved = []
+    global INDEX
+    for f in files:
+        name = norm_filename(f.filename or "file")
+        path = UPLOADS / name
+        data = await f.read()
+        path.write_bytes(data)
+        saved.append(name)
+
+        if ingest:
+            text = ""
+            if name.lower().endswith((".txt",".md",".log",".csv",".json")):
+                try: text = data.decode("utf-8","ignore")
+                except: text = ""
+            elif name.lower().endswith(".pdf"):
+                text = read_pdf(path)
+            else:
+                continue
+            title = os.path.splitext(name)[0]
+            INDEX = add_document(title, text, source="file", cfg=CONFIG)
+    return {"saved": saved, "ingested": ingest}
+
+@app.get("/api/files/list")
+def list_files():
+    items = []
+    for p in sorted(UPLOADS.glob("*")):
+        if p.is_file():
+            items.append({"name": p.name, "size": p.stat().st_size})
+    return {"files": items}
+
+@app.get("/api/files/download")
+def download_file(name: str):
+    safe = norm_filename(name)
+    path = UPLOADS / safe
+    if not path.exists(): raise HTTPException(404, "File not found")
+    return FileResponse(str(path), filename=safe)
+
+@app.delete("/api/files/delete")
+def delete_file(name: str):
+    safe = norm_filename(name)
+    path = UPLOADS / safe
+    if path.exists(): path.unlink()
+    return {"deleted": safe}
+
+# ---------- RAG: docs + URL ingest ----------
+@app.get("/api/rag/docs")
+def rag_docs():
+    docs = []
+    for p in sorted(DOCS.glob("*.txt")):
+        docs.append({"id": p.stem, "title": p.name, "size": p.stat().st_size})
+    return {"docs": docs, "chunks": INDEX.N}
+
+@app.post("/api/rag/reindex")
+def rag_reindex():
+    global INDEX
+    INDEX = reindex_all(CONFIG)
+    return {"status": "ok", "chunks": INDEX.N}
+
+@app.post("/api/rag/add_url")
+async def rag_add_url(url: str = Form(...)):
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as c:
+        r = await c.get(url)
+        r.raise_for_status()
+        title, body = html_to_text(r.text)
+    title = title or url
+    global INDEX
+    INDEX = add_document(title, f"URL: {url}\n\n{body}", source="url", cfg=CONFIG)
+    return {"status": "ok", "title": title, "chunks": INDEX.N}
+
+@app.post("/api/rag/query")
+def rag_query(q: str = Form(...), k: int = Query(None)):
+    k = k or CONFIG.get("rag_k", 4)
+    hits = bm25_search(q, INDEX, k=k)
+    result = [{"chunk_id": cid, "score": s, "text": INDEX.chunks[cid]["text"]} for cid,s in hits]
+    return {"hits": result}
+
+# ---------- Model management (Ollama) ----------
+async def ollama_up() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as c:
+            r = await c.get(f"{CONFIG['ollama_host']}/api/tags")
+            return r.status_code == 200
+    except Exception:
+        return False
+
+@app.get("/api/models")
+async def list_models():
+    if await ollama_up():
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(f"{CONFIG['ollama_host']}/api/tags")
+            names = [t.get("name") for t in r.json().get("models", []) if t.get("name")]
+        return {"provider": "ollama", "models": names}
+    return {"provider": "local-fallback", "models": ["fallback-local"]}
+
+@app.post("/api/models/pull")
+async def models_pull(name: str = Form(...)):
+    if not await ollama_up():
+        raise HTTPException(400, "Ollama not available")
+    payload = {"name": name, "stream": True}
+    async def stream():
+        try:
+            async with httpx.AsyncClient(timeout=None) as c:
+                async with c.stream("POST", f"{CONFIG['ollama_host']}/api/pull", json=payload) as resp:
+                    async for line in resp.aiter_lines():
+                        if not line: continue
+                        yield f"data: {line}\n\n"
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        yield "event: end\ndata: {}\n\n"
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+@app.delete("/api/models/delete")
+async def models_delete(name: str):
+    if not await ollama_up():
+        raise HTTPException(400, "Ollama not available")
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        r = await c.request("DELETE", f"{CONFIG['ollama_host']}/api/delete", json={"name": name})
+    return r.json()
+
+@app.post("/api/models/show")
+async def models_show(name: str = Form(...)):
+    if not await ollama_up():
+        raise HTTPException(400, "Ollama not available")
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        r = await c.post(f"{CONFIG['ollama_host']}/api/show", json={"name": name})
+    return r.json()
+
+# ---------- Chat ----------
+class ChatRequest(BaseModel):
+    messages: List[Dict[str, str]]
+    model: Optional[str] = None
+    stream: bool = True
+    use_rag: Optional[bool] = None
+
+def _fallback_reply(messages: List[Dict[str, str]]) -> str:
+    s = next((m.get("content","") for m in reversed(messages) if m.get("role")=="user"), "").strip()
+    if s.lower().startswith(("sum ","add ")):
+        nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", s)]
+        return f"Sum: {sum(nums)}" if nums else "I didn't find any numbers to add."
+    if re.match(r"^\s*help\s*$", s, re.I):
+        return ("Fallback online. Upload PDFs/TXT in Upload, toggle RAG in Settings, "
+                "or add URLs in Knowledge. If Ollama is running, I’ll use it.")
+    if s.lower() in {"hi","hello","hey"}: return "Hey! Local fallback here. Ask me anything."
+    return f"Local fallback: you said -> {s or '...'}"
+
+def build_rag_system_prompt(query: str, k: int) -> Optional[str]:
+    hits = bm25_search(query, INDEX, k=k)
+    if not hits: return None
+    ctx = "\n\n".join(f"[{i+1}] {INDEX.chunks[c]['text']}" for i,(c,_) in enumerate(hits))
+    return ("Use the following context to answer. If the answer isn’t in the context, say so.\n\n"
+            f"Query: {query}\n\nContext:\n{ctx}")
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    messages = list(req.messages)
+    use_rag = req.use_rag if req.use_rag is not None else CONFIG.get("rag_enabled", True)
+    if use_rag and messages:
+        q = next((m["content"] for m in reversed(messages) if m["role"]=="user"), "")
+        sys_prompt = build_rag_system_prompt(q, CONFIG.get("rag_k", 4))
+        if sys_prompt:
+            messages = [{"role":"system", "content": sys_prompt}] + messages
+
+    if await ollama_up():
+        model = req.model or CONFIG["model"]
+        options = {
+            "temperature": CONFIG["temperature"],
+            "top_p": CONFIG["top_p"],
+            "num_predict": CONFIG["max_tokens"]
+        }
+        payload = {"model": model, "messages": messages, "stream": True, "options": options}
+
+        async def stream_ollama():
+            try:
+                async with httpx.AsyncClient(timeout=None) as c:
+                    async with c.stream("POST", f"{CONFIG['ollama_host']}/api/chat", json=payload) as resp:
+                        async for line in resp.aiter_lines():
+                            if not line: continue
+                            try:
+                                obj = json.loads(line)
+                                if "message" in obj and obj["message"].get("content"):
+                                    yield f"data: {json.dumps({'delta': obj['message']['content']})}\n\n"
+                                if obj.get("done"): yield "event: end\ndata: {}\n\n"
+                            except Exception:
+                                yield f"data: {json.dumps({'delta': line})}\n\n"
+            except Exception as e:
+                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        return StreamingResponse(stream_ollama(), media_type="text/event-stream")
+
+    text = _fallback_reply(messages)
+    async def stream_local():
+        for ch in text:
+            await asyncio.sleep(0)
+            yield f"data: {json.dumps({'delta': ch})}\n\n"
+        yield "event: end\ndata: {}\n\n"
+    return StreamingResponse(stream_local(), media_type="text/event-stream")
+
+# ----------------------------
+# Minimal single-file UI at /ui (adds Models modal)
+# ----------------------------
+_UI_HTML = r"""<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>LLM Studio — Chat</title>
+<style>
+:root{--bg:#0f172a;--panel:#111827;--ink:#e5e7eb;--muted:#9ca3af;--acc:#22d3ee}
+*{box-sizing:border-box}body{margin:0;font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink)}
+header{padding:10px 16px;border-bottom:1px solid #1f2937;display:flex;gap:10px;align-items:center}
+h1{margin:0;font-size:16px}
+.pill{background:#0b1220;border:1px solid #1f2937;border-radius:999px;padding:6px 10px;color:var(--muted)}
+.toolbar{display:flex;gap:8px;margin-left:auto}
+button,select,input[type="checkbox"]{background:#111827;color:var(--ink);border:1px solid #1f2937;border-radius:10px;padding:8px 10px;cursor:pointer}
+button:hover{border-color:#2dd4bf}
+main{height:calc(100vh - 56px);display:grid;grid-template-rows:1fr auto}
+#log{padding:18px;overflow-y:auto}
+.msg{max-width:1000px;margin:0 auto 10px;display:flex;gap:10px}
+.role{width:80px;text-align:right;color:var(--acc);font-weight:600}
+.you .role{color:#a3e635}
+.bubble{background:#0b1220;border:1px solid #1f2937;border-radius:14px;padding:10px 12px;white-space:pre-wrap}
+form{display:flex;gap:10px;padding:12px 16px;background:#0b1220;border-top:1px solid #1f2937}
+textarea{flex:1;min-height:52px;max-height:160px;resize:vertical;background:#0a0f1d;color:var(--ink);border:1px solid #1f2937;border-radius:12px;padding:10px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center}
+.card{width:min(920px,96vw);background:#0b1020;border:1px solid #1f2937;border-radius:16px;padding:16px}
+.grid{display:grid;gap:10px}.grid.cols-2{grid-template-columns:1fr 1fr}
+label span{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{border-bottom:1px solid #1f2937;padding:8px;text-align:left}
+pre{background:#0a0f1d;border:1px solid #1f2937;border-radius:10px;padding:8px;max-height:240px;overflow:auto}
+</style></head><body>
+<header>
+  <h1>LLM Studio — Chat</h1>
+  <span class="pill" id="provider">detecting…</span>
+  <div class="toolbar">
+    <button id="btnUpload">Upload</button>
+    <button id="btnFiles">Files</button>
+    <button id="btnKnowledge">Knowledge</button>
+    <button id="btnModels">Models</button>
+    <button id="btnSettings">Settings</button>
+    <label>Model <select id="model"></select></label>
+  </div>
+</header>
+<main>
+  <div id="log"></div>
+  <form id="composer">
+    <textarea id="input" placeholder="Type a message and press Enter…"></textarea>
+    <label title="Use RAG"><input type="checkbox" id="useRag" checked> RAG</label>
+    <button id="send" type="submit">Send</button>
+  </form>
+</main>
+
+<!-- Upload modal -->
+<div class="modal" id="modalUpload"><div class="card">
+  <h3>Upload</h3>
+  <p>Accepted: .txt, .md, .pdf (optional: ingest to Knowledge)</p>
+  <div class="grid cols-2">
+    <label><span>Files</span><input id="fileInput" type="file" multiple /></label>
+    <label><span>Ingest into Knowledge</span><input id="ingest" type="checkbox" /></label>
+  </div>
+  <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:10px">
+    <button id="doUpload">Upload</button>
+    <button onclick="closeModal('modalUpload')" type="button">Close</button>
+  </div>
+</div></div>
+
+<!-- Files modal -->
+<div class="modal" id="modalFiles"><div class="card">
+  <h3>Files</h3>
+  <table id="filesTable"><thead><tr><th>Name</th><th>Size</th><th>Actions</th></tr></thead><tbody></tbody></table>
+  <div style="text-align:right"><button onclick="closeModal('modalFiles')" type="button">Close</button></div>
+</div></div>
+
+<!-- Knowledge modal -->
+<div class="modal" id="modalKnowledge"><div class="card">
+  <h3>Knowledge Base</h3>
+  <div class="grid">
+    <div class="grid cols-2">
+      <label><span>Add URL (fetch & index)</span><input id="kbUrl" placeholder="https://example.com/article"/></label>
+      <button id="addUrl">Add URL</button>
+    </div>
+    <div>
+      <button id="reindex">Rebuild Index</button>
+      <span id="kbInfo" style="margin-left:10px;color:var(--muted)"></span>
+    </div>
+    <table id="kbTable"><thead><tr><th>Doc ID</th><th>Title</th><th>Size</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div style="text-align:right"><button onclick="closeModal('modalKnowledge')" type="button">Close</button></div>
+</div></div>
+
+<!-- Models modal -->
+<div class="modal" id="modalModels"><div class="card">
+  <h3>Models (Ollama)</h3>
+  <div class="grid cols-2">
+    <label><span>Pull model (e.g., llama3.2:latest)</span><input id="pullName" placeholder="model:tag"/></label>
+    <button id="doPull">Pull</button>
+  </div>
+  <pre id="pullLog" style="margin-top:8px"></pre>
+  <table id="modelsTable" style="margin-top:10px">
+    <thead><tr><th>Name</th><th>Actions</th></tr></thead><tbody></tbody>
+  </table>
+  <div style="text-align:right"><button onclick="closeModal('modalModels')" type="button">Close</button></div>
+</div></div>
+
+<!-- Settings modal -->
+<div class="modal" id="modalSettings"><div class="card">
+  <h3>Settings</h3>
+  <div class="grid cols-2">
+    <label><span>Ollama Host</span><input id="s_ollama_host" /></label>
+    <label><span>Model</span><input id="s_model" /></label>
+    <label><span>Temperature</span><input id="s_temperature" type="number" step="0.01" /></label>
+    <label><span>Top P</span><input id="s_top_p" type="number" step="0.01" /></label>
+    <label><span>Max Tokens</span><input id="s_max_tokens" type="number" /></label>
+    <label><span>RAG Enabled</span><input id="s_rag_enabled" type="checkbox" /></label>
+    <label><span>RAG Top-K</span><input id="s_rag_k" type="number" /></label>
+    <label><span>Chunk Size</span><input id="s_chunk_size" type="number" /></label>
+    <label><span>Chunk Overlap</span><input id="s_chunk_overlap" type="number" /></label>
+    <label><span>Web Enabled</span><input id="s_web_enabled" type="checkbox" /></label>
+  </div>
+  <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:10px">
+    <button id="saveSettings">Save</button>
+    <button onclick="closeModal('modalSettings')" type="button">Close</button>
+  </div>
+</div></div>
+
+<script>
+const el = {
+  log: document.getElementById('log'),
+  input: document.getElementById('input'),
+  form: document.getElementById('composer'),
+  model: document.getElementById('model'),
+  provider: document.getElementById('provider'),
+  useRag: document.getElementById('useRag'),
+  // modals
+  mUpload: document.getElementById('modalUpload'),
+  mFiles: document.getElementById('modalFiles'),
+  mSettings: document.getElementById('modalSettings'),
+  mKnowledge: document.getElementById('modalKnowledge'),
+  mModels: document.getElementById('modalModels'),
+  // upload
+  fileInput: document.getElementById('fileInput'),
+  ingest: document.getElementById('ingest'),
+  filesTable: document.getElementById('filesTable').querySelector('tbody'),
+  // knowledge
+  kbTable: document.getElementById('kbTable').querySelector('tbody'),
+  kbInfo: document.getElementById('kbInfo'),
+  kbUrl: document.getElementById('kbUrl'),
+  // models
+  modelsTable: document.getElementById('modelsTable').querySelector('tbody'),
+  pullName: document.getElementById('pullName'),
+  pullLog: document.getElementById('pullLog'),
+  // settings inputs
+  s_ollama_host: document.getElementById('s_ollama_host'),
+  s_model: document.getElementById('s_model'),
+  s_temperature: document.getElementById('s_temperature'),
+  s_top_p: document.getElementById('s_top_p'),
+  s_max_tokens: document.getElementById('s_max_tokens'),
+  s_rag_enabled: document.getElementById('s_rag_enabled'),
+  s_rag_k: document.getElementById('s_rag_k'),
+  s_chunk_size: document.getElementById('s_chunk_size'),
+  s_chunk_overlap: document.getElementById('s_chunk_overlap'),
+  s_web_enabled: document.getElementById('s_web_enabled'),
+};
+
+let history = [{role:"system", content:"You are a helpful assistant."}];
+
+function openModal(id){ document.getElementById(id).style.display='flex'; }
+function closeModal(id){ document.getElementById(id).style.display='none'; }
+
+document.getElementById('btnUpload').onclick = ()=>{ openModal('modalUpload'); };
+document.getElementById('btnFiles').onclick = async ()=>{ await refreshFiles(); openModal('modalFiles'); };
+document.getElementById('btnSettings').onclick = async ()=>{ await loadSettings(); openModal('modalSettings'); };
+document.getElementById('btnKnowledge').onclick = async ()=>{ await refreshKnowledge(); openModal('modalKnowledge'); };
+document.getElementById('btnModels').onclick = async ()=>{ await refreshModels(); openModal('modalModels'); };
+
+async function loadModels(){
+  try{
+    const res = await fetch('/api/models'); const d = await res.json();
+    el.provider.textContent = d.provider; el.model.innerHTML = '';
+    (d.models||['fallback-local']).forEach(n=>{
+      const opt=document.createElement('option'); opt.value=opt.textContent=n; el.model.appendChild(opt);
+    });
+  }catch(e){ el.provider.textContent='unknown'; el.model.innerHTML='<option>fallback-local</option>'; }
+}
+loadModels();
+
+function addMessage(role, text){
+  const w = document.createElement('div'); w.className='msg '+(role==='user'?'you':'bot');
+  const r = document.createElement('div'); r.className='role'; r.textContent = role;
+  const b = document.createElement('div'); b.className='bubble'; b.textContent = text;
+  w.appendChild(r); w.appendChild(b); el.log.appendChild(w); el.log.scrollTop = el.log.scrollHeight; return b;
+}
+
+async function send(){
+  const text = el.input.value.trim(); if(!text) return;
+  el.input.value=''; history.push({role:'user', content:text}); addMessage('user', text);
+  const bubble = addMessage('assistant', '');
+  const res = await fetch('/api/chat', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({messages: history, model: el.model.value, stream:true, use_rag: el.useRag.checked})
+  });
+  const reader = res.body.getReader(); const dec = new TextDecoder(); let buf='';
+  for(;;){
+    const {value,done} = await reader.read(); if(done) break;
+    buf += dec.decode(value,{stream:true}); const parts = buf.split('\\n\\n'); buf = parts.pop();
+    for(const p of parts){
+      const line = p.trim(); if(!line) continue;
+      if(line.startsWith('event: end')){ break; }
+      if(line.startsWith('data: ')){ try{ const payload = JSON.parse(line.slice(6)); if(payload.delta) bubble.textContent += payload.delta; }catch{} }
+    }
+  }
+  history.push({role:'assistant', content:bubble.textContent});
+}
+el.form.addEventListener('submit', e=>{ e.preventDefault(); send(); });
+el.input.addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); } });
+
+// Upload
+document.getElementById('doUpload').onclick = async ()=>{
+  const fd = new FormData();
+  for(const f of el.fileInput.files){ fd.append('files', f); }
+  const ingest = el.ingest.checked ? 'true' : 'false';
+  const res = await fetch('/api/files/upload?ingest='+ingest, { method:'POST', body: fd });
+  await res.json(); await refreshFiles(); await refreshKnowledge(); alert('Upload complete'); closeModal('modalUpload');
+};
+
+// Files list
+async function refreshFiles(){
+  el.filesTable.innerHTML='';
+  const res = await fetch('/api/files/list'); const d = await res.json();
+  for(const it of d.files||[]){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${it.name}</td><td>${it.size}</td>
+      <td>
+        <a href="/api/files/download?name=${encodeURIComponent(it.name)}">Download</a>
+        &nbsp;|&nbsp;
+        <a href="#" data-del="${it.name}">Delete</a>
+      </td>`;
+    el.filesTable.appendChild(tr);
+  }
+  el.filesTable.querySelectorAll('a[data-del]').forEach(a=>{
+    a.onclick = async (e)=>{ e.preventDefault();
+      const name = a.getAttribute('data-del');
+      await fetch('/api/files/delete?name='+encodeURIComponent(name), {method:'DELETE'});
+      await refreshFiles();
+    };
+  });
+}
+
+// Knowledge
+async function refreshKnowledge(){
+  el.kbTable.innerHTML='';
+  const r = await fetch('/api/rag/docs'); const d = await r.json();
+  el.kbInfo.textContent = `Chunks: ${d.chunks}`;
+  for(const doc of d.docs||[]){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${doc.id}</td><td>${doc.title}</td><td>${doc.size}</td>`;
+    el.kbTable.appendChild(tr);
+  }
+}
+document.getElementById('reindex').onclick = async ()=>{
+  await fetch('/api/rag/reindex', {method:'POST'}); await refreshKnowledge();
+};
+document.getElementById('addUrl').onclick = async ()=>{
+  const url = el.kbUrl.value.trim(); if(!url) return;
+  const fd = new FormData(); fd.append('url', url);
+  await fetch('/api/rag/add_url', {method:'POST', body: fd});
+  await refreshKnowledge(); el.kbUrl.value='';
+};
+
+// Settings
+async function loadSettings(){
+  const r = await fetch('/api/settings'); const s = await r.json();
+  el.s_ollama_host.value = s.ollama_host || '';
+  el.s_model.value = s.model || '';
+  el.s_temperature.value = s.temperature;
+  el.s_top_p.value = s.top_p; el.s_max_tokens.value = s.max_tokens;
+  el.s_rag_enabled.checked = !!s.rag_enabled; el.useRag.checked = !!s.rag_enabled;
+  el.s_rag_k.value = s.rag_k; el.s_chunk_size.value = s.chunk_size; el.s_chunk_overlap.value = s.chunk_overlap;
+  el.s_web_enabled.checked = !!s.web_enabled;
+}
+document.getElementById('saveSettings').onclick = async ()=>{
+  const payload = {
+    ollama_host: el.s_ollama_host.value, model: el.s_model.value,
+    temperature: Number(el.s_temperature.value), top_p: Number(el.s_top_p.value),
+    max_tokens: Number(el.s_max_tokens.value), rag_enabled: el.s_rag_enabled.checked,
+    rag_k: Number(el.s_rag_k.value), chunk_size: Number(el.s_chunk_size.value),
+    chunk_overlap: Number(el.s_chunk_overlap.value), web_enabled: el.s_web_enabled.checked
+  };
+  await fetch('/api/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  await loadModels(); alert('Saved'); closeModal('modalSettings');
+};
+
+// Models
+async function refreshModels(){
+  el.modelsTable.innerHTML=''; el.pullLog.textContent='';
+  const r = await fetch('/api/models'); const d = await r.json();
+  if(d.provider!=='ollama'){
+    const tr=document.createElement('tr'); tr.innerHTML=`<td colspan="2">Ollama not available on ${d.provider}. Start Ollama to manage models.</td>`;
+    el.modelsTable.appendChild(tr); return;
+  }
+  (d.models||[]).forEach(name=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML = `<td>${name}</td>
+      <td>
+        <a href="#" data-use="${name}">Use</a>
+        &nbsp;|&nbsp;
+        <a href="#" data-del="${name}">Delete</a>
+      </td>`;
+    el.modelsTable.appendChild(tr);
+  });
+  el.modelsTable.querySelectorAll('a[data-use]').forEach(a=>{
+    a.onclick = async (e)=>{ e.preventDefault();
+      const name = a.getAttribute('data-use');
+      el.model.value = name;
+      await fetch('/api/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model:name})});
+      await loadModels(); alert('Default model set to '+name);
+    };
+  });
+  el.modelsTable.querySelectorAll('a[data-del]').forEach(a=>{
+    a.onclick = async (e)=>{ e.preventDefault();
+      const name = a.getAttribute('data-del');
+      if(!confirm('Delete model '+name+'?')) return;
+      await fetch('/api/models/delete?name='+encodeURIComponent(name), {method:'DELETE'});
+      await refreshModels(); await loadModels();
+    };
+  });
+}
+document.getElementById('doPull').onclick = async ()=>{
+  const name = el.pullName.value.trim(); if(!name) return;
+  el.pullLog.textContent = '';
+  const fd = new FormData(); fd.append('name', name);
+  const res = await fetch('/api/models/pull', {method:'POST', body: fd});
+  const reader = res.body.getReader(); const dec = new TextDecoder(); let buf='';
+  for(;;){
+    const {value,done} = await reader.read(); if(done) break;
+    buf += dec.decode(value,{stream:true}); const parts = buf.split('\\n\\n'); buf = parts.pop();
+    for(const p of parts){
+      const line=p.trim(); if(!line) continue;
+      if(line.startsWith('data: ')){ try{
+        const payload = JSON.parse(line.slice(6));
+        el.pullLog.textContent += (payload.status || JSON.stringify(payload)) + "\\n";
+        el.pullLog.scrollTop = el.pullLog.scrollHeight;
+      }catch{ el.pullLog.textContent += line + "\\n"; } }
+    }
+  }
+  await refreshModels(); await loadModels();
+};
+</script>
+</body></html>
+"""
+
+@app.get("/ui")
+def ui(): return HTMLResponse(_UI_HTML)
+
+@app.get("/")
+def root():
+    return {"name": APP_NAME, "message": "It works!", "health": "/health", "ui": "/ui"}

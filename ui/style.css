@@ -1,0 +1,13 @@
+/* Simple clean style */
+body,html{margin:0;padding:0;height:100%;font-family:Arial,sans-serif;background:#f3f3f3;}
+.container{display:flex;flex-direction:column;height:100vh;max-width:800px;margin:auto;}
+header{display:flex;align-items:center;padding:10px;background:#2b2d31;color:#fff;}
+header h1{flex:1;margin:0;font-size:1.2rem;}
+main{flex:1;overflow-y:auto;padding:10px;background:#fff;}
+footer{display:flex;gap:5px;padding:10px;background:#eaeaea;}
+textarea{flex:1;padding:5px;font-size:1rem;}
+button{padding:5px 10px;font-size:1rem;cursor:pointer;}
+.message{margin:8px 0;}
+.message.user{text-align:right;}
+.message.assistant{text-align:left;}
+.message pre{background:#eee;padding:8px;overflow:auto;}

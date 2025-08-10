@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LLM‑Studio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>LLM‑Studio</h1>
+    <select id="modelSelect"></select>
+  </header>
+
+  <main id="chatBox"></main>
+
+  <footer>
+    <textarea id="prompt" placeholder="Ask something..." rows="2"></textarea>
+    <button id="sendBtn">Send</button>
+    <button id="uploadBtn">Upload</button>
+    <input type="file" id="fileInput" style="display:none">
+  </footer>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
